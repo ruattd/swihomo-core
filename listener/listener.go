@@ -496,6 +496,7 @@ func ReCreateMixed(port int, tunnel C.Tunnel) {
 }
 
 func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
+	tunConf = sing_tun.NormalizeForEmbeddedTun(tunConf)
 	tunConf.Sort()
 
 	tunMux.Lock()
@@ -515,8 +516,8 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 	if tunConf.Equal(LastTunConf) {
 		if tunLister != nil { // some default value in dialer maybe changed when config reload, reset at here
 			tunLister.OnReload()
+			return
 		}
-		return
 	}
 
 	closeTunListener()

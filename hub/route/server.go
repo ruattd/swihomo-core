@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -90,6 +92,9 @@ func (c Cors) Apply(r chi.Router) {
 }
 
 func ReCreateServer(cfg *Config) {
+	// In-process dispatch for the embedded Network Extension bridge: trusted by
+	// construction, so the mux is built without the authentication middleware.
+	localHandler = router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors)
 	go start(cfg)
 	go startTLS(cfg)
 	go startUnix(cfg)
@@ -100,6 +105,163 @@ func ReCreateServer(cfg *Config) {
 
 func SetUIPath(path string) {
 	uiPath = C.Path.Resolve(path)
+}
+
+var localHandler http.Handler
+
+// HandleLocalRequest dispatches an API request against the in-process router without a
+// listener. The bridge reports the recorder's status code and body back over its C ABI.
+func HandleLocalRequest(method, target string, body []byte) (int, []byte) {
+	handler := localHandler
+	if handler == nil {
+		return http.StatusServiceUnavailable, []byte(`{"message":"mihomo core is not running"}`)
+	}
+	req, err := http.NewRequest(method, target, bytes.NewReader(body))
+	if err != nil {
+		return http.StatusBadRequest, []byte(`{"message":"invalid api request"}`)
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	recorder := &localResponseRecorder{header: http.Header{}, code: http.StatusOK}
+	handler.ServeHTTP(recorder, req)
+	return recorder.code, recorder.body.Bytes()
+}
+
+// Minimal ResponseWriter: metacubex/http is a fork with distinct types, so the stdlib
+// httptest recorder does not satisfy it.
+type localResponseRecorder struct {
+	header http.Header
+	code   int
+	body   bytes.Buffer
+}
+
+func (r *localResponseRecorder) Header() http.Header { return r.header }
+
+func (r *localResponseRecorder) WriteHeader(code int) { r.code = code }
+
+func (r *localResponseRecorder) Write(data []byte) (int, error) { return r.body.Write(data) }
+
+// localStream is a ResponseWriter for endpoints that flush chunks indefinitely
+// (traffic/logs style). Each write is buffered until the bridge drains it; once the
+// stream is closed, writes fail so the handler's loop exits.
+type localStream struct {
+	header http.Header
+	code   int
+
+	mu     sync.Mutex
+	buffer bytes.Buffer
+	closed bool
+	notify chan struct{}
+}
+
+var errLocalStreamClosed = errors.New("local api stream is closed")
+
+func (s *localStream) Header() http.Header { return s.header }
+
+func (s *localStream) WriteHeader(code int) { s.code = code }
+
+func (s *localStream) Write(data []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return 0, errLocalStreamClosed
+	}
+	n, err := s.buffer.Write(data)
+	select {
+	case s.notify <- struct{}{}:
+	default:
+	}
+	return n, err
+}
+
+// Flush is a no-op: every Write is already visible to the reader.
+func (s *localStream) Flush() {}
+
+var (
+	localStreams   = map[uint64]*localStream{}
+	localStreamsMu sync.Mutex
+	// Stream IDs start above the bridge's error-code range so the two never collide.
+	nextStreamID uint64 = 100
+)
+
+// HandleLocalStreamOpen dispatches a streaming API request against the in-process
+// router: ServeHTTP runs in a goroutine while buffered chunks are drained with
+// HandleLocalStreamRead. Returns 0 when the core is not running.
+func HandleLocalStreamOpen(method, target string, body []byte) uint64 {
+	handler := localHandler
+	if handler == nil {
+		return 0
+	}
+	req, err := http.NewRequest(method, target, bytes.NewReader(body))
+	if err != nil {
+		return 0
+	}
+	if len(body) > 0 {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	stream := &localStream{header: http.Header{}, code: http.StatusOK, notify: make(chan struct{}, 1)}
+
+	localStreamsMu.Lock()
+	nextStreamID++
+	id := nextStreamID
+	localStreams[id] = stream
+	localStreamsMu.Unlock()
+
+	go func() {
+		handler.ServeHTTP(stream, req)
+		stream.mu.Lock()
+		stream.closed = true
+		stream.mu.Unlock()
+	}()
+	return id
+}
+
+// HandleLocalStreamRead drains the buffered chunks of a stream; eof reports that the
+// handler exited (or the stream id is unknown). With nothing buffered it blocks until
+// a write lands, the stream closes, or the timeout elapses.
+func HandleLocalStreamRead(id uint64, timeout time.Duration) (data []byte, eof bool) {
+	localStreamsMu.Lock()
+	stream, ok := localStreams[id]
+	localStreamsMu.Unlock()
+	if !ok {
+		return nil, true
+	}
+
+	stream.mu.Lock()
+	empty := stream.buffer.Len() == 0 && !stream.closed
+	stream.mu.Unlock()
+	if empty {
+		select {
+		case <-stream.notify:
+		case <-time.After(timeout):
+		}
+	}
+
+	stream.mu.Lock()
+	defer stream.mu.Unlock()
+	data = append([]byte(nil), stream.buffer.Bytes()...)
+	stream.buffer.Reset()
+	return data, stream.closed
+}
+
+// HandleLocalStreamClose tears a stream down: buffered data is dropped and further
+// handler writes fail.
+func HandleLocalStreamClose(id uint64) {
+	localStreamsMu.Lock()
+	stream, ok := localStreams[id]
+	delete(localStreams, id)
+	localStreamsMu.Unlock()
+	if ok {
+		stream.mu.Lock()
+		stream.closed = true
+		// Wake a blocked reader so it observes the close immediately.
+		select {
+		case stream.notify <- struct{}{}:
+		default:
+		}
+		stream.mu.Unlock()
+	}
 }
 
 func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
@@ -136,9 +298,11 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Mount("/dns", dnsRouter())
 		r.Mount("/storage", storageRouter())
 		if !embedMode { // disallow restart in embed mode
-			r.Mount("/restart", restartRouter())
+			// This customized core runs in a Network Extension and does not support restarting or core upgrades.
+			r.Mount("/restart", disableNetworkExtensionOperation("/restart", restartRouter()))
 		}
-		r.Mount("/upgrade", upgradeRouter())
+		// This customized core runs in a Network Extension and does not support restarting or core upgrades.
+		r.Mount("/upgrade", disableNetworkExtensionOperation("/upgrade", upgradeRouter()))
 		addExternalRouters(r)
 
 	})
@@ -157,6 +321,17 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 	}
 
 	return r
+}
+
+func disableNetworkExtensionOperation(path string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && (r.URL.Path == path || r.URL.Path == path+"/") {
+			render.Status(r, http.StatusForbidden)
+			render.JSON(w, r, newError("This operation is not supported by the Network Extension core"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func start(cfg *Config) {
