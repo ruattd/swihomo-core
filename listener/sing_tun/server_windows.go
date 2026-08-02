@@ -10,6 +10,9 @@ import (
 )
 
 func tunNew(options tun.Options) (tunIf tun.Tun, err error) {
+	if tunIf, embedded, err := embeddedTunFactory(options); embedded {
+		return tunIf, err
+	}
 	maxRetry := 3
 	for i := 0; i < maxRetry; i++ {
 		timeBegin := time.Now()
