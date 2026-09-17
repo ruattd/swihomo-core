@@ -25,11 +25,11 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/metacubex/mihomo/bridge/packetflow"
 	constant "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/hub/route"
-	"github.com/metacubex/mihomo/listener/sing_tun"
 	"github.com/metacubex/mihomo/log"
 	tun "github.com/metacubex/sing-tun"
 	"go.yaml.in/yaml/v3"
@@ -46,7 +46,7 @@ const (
 
 var runtime = struct {
 	sync.Mutex
-	tun        *sing_tun.PacketFlowTun
+	tun        *packetflow.PacketFlowTun
 	restore    func()
 	running    bool
 	lastErr    string
@@ -72,6 +72,7 @@ func SwihomoCoreStart(
 	profile *C.uint8_t,
 	profileLength C.size_t,
 	homeDirectory *C.char,
+	useMipstack C.int,
 ) C.int {
 	runtime.Lock()
 	defer runtime.Unlock()
@@ -102,8 +103,13 @@ func SwihomoCoreStart(
 	startLogCaptureLocked()
 	log.Infoln("Swihomo packet-flow bridge starting")
 
-	runtime.restore = sing_tun.SetTunFactory(func(options tun.Options) (tun.Tun, error) {
-		packetTun := sing_tun.NewPacketFlowTun(options.MTU, emitPacket)
+	if useMipstack != 0 {
+		packetflow.SetStackMode(constant.TunMips)
+	} else {
+		packetflow.SetStackMode(constant.TunGvisor)
+	}
+	runtime.restore = packetflow.SetTunFactory(func(options tun.Options) (tun.Tun, error) {
+		packetTun := packetflow.NewPacketFlowTun(options.MTU, emitPacket)
 		runtime.tun = packetTun
 		return packetTun, nil
 	})
