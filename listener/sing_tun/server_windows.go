@@ -3,6 +3,7 @@ package sing_tun
 import (
 	"time"
 
+	"github.com/metacubex/mihomo/bridge/packetflow"
 	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/log"
 
@@ -10,7 +11,7 @@ import (
 )
 
 func tunNew(options tun.Options) (tunIf tun.Tun, err error) {
-	if tunIf, embedded, err := embeddedTunFactory(options); embedded {
+	if tunIf, embedded, err := packetflow.EmbeddedTunFactory(options); embedded {
 		return tunIf, err
 	}
 	maxRetry := 3
