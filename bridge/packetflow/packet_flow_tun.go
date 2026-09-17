@@ -1,6 +1,6 @@
 //go:build with_gvisor && (darwin || ios)
 
-package sing_tun
+package packetflow
 
 import (
 	"context"
@@ -13,18 +13,27 @@ import (
 	"github.com/metacubex/gvisor/pkg/tcpip/header"
 	"github.com/metacubex/gvisor/pkg/tcpip/link/channel"
 	"github.com/metacubex/gvisor/pkg/tcpip/stack"
+	C "github.com/metacubex/mihomo/constant"
 	tun "github.com/metacubex/sing-tun"
 )
 
 const (
 	packetFlowIPv4 = 2
 	packetFlowIPv6 = 30
+
+	// inboundQueueSize bounds packets buffered between InjectPacket and the
+	// raw stack's read loop. Sized like the gVisor channel endpoint.
+	inboundQueueSize = 1024
 )
 
 // PacketFlowTun adapts raw packets from a Network Extension packet flow to
-// mihomo's gVisor TUN stack without opening another utun interface.
+// mihomo's TUN stacks without opening another utun interface. In gVisor mode
+// packets are injected into a channel endpoint; in raw mode (mips stack)
+// they queue for Read instead.
 type PacketFlowTun struct {
 	endpoint *channel.Endpoint
+	inbound  chan []byte
+	raw      bool
 	context  context.Context
 	cancel   context.CancelFunc
 	emit     func([]byte, int) error
@@ -39,16 +48,32 @@ func NewPacketFlowTun(mtu uint32, emit func([]byte, int) error) *PacketFlowTun {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &PacketFlowTun{
-		endpoint: channel.New(1024, mtu, ""),
-		context:  ctx,
-		cancel:   cancel,
-		emit:     emit,
+		context: ctx,
+		cancel:  cancel,
+		emit:    emit,
 	}
-	go p.drainOutboundPackets()
+	if StackMode() == C.TunGvisor {
+		p.endpoint = channel.New(inboundQueueSize, mtu, "")
+		go p.drainOutboundPackets()
+	} else {
+		p.raw = true
+		p.inbound = make(chan []byte, inboundQueueSize)
+	}
 	return p
 }
 
 func (p *PacketFlowTun) InjectPacket(packet []byte, family int) error {
+	if p.raw {
+		// Never block: the bridge may hold its state lock while injecting,
+		// and Close runs under the same lock. Drop on a full queue like the
+		// gVisor channel endpoint does.
+		select {
+		case p.inbound <- append([]byte(nil), packet...):
+		default:
+		}
+		return nil
+	}
+
 	protocol, err := packetFlowProtocol(packet, family)
 	if err != nil {
 		return err
@@ -61,7 +86,16 @@ func (p *PacketFlowTun) InjectPacket(packet []byte, family int) error {
 	return nil
 }
 
-func (p *PacketFlowTun) Read([]byte) (int, error) {
+func (p *PacketFlowTun) Read(packet []byte) (int, error) {
+	if p.raw {
+		select {
+		case inbound := <-p.inbound:
+			// Truncating an over-MTU packet matches kernel utun semantics.
+			return copy(packet, inbound), nil
+		case <-p.context.Done():
+			return 0, io.ErrClosedPipe
+		}
+	}
 	<-p.context.Done()
 	return 0, io.ErrClosedPipe
 }
@@ -80,7 +114,9 @@ func (p *PacketFlowTun) Write(packet []byte) (int, error) {
 func (p *PacketFlowTun) Close() error {
 	p.close.Do(func() {
 		p.cancel()
-		p.endpoint.Close()
+		if p.endpoint != nil {
+			p.endpoint.Close()
+		}
 	})
 	return nil
 }
@@ -97,6 +133,9 @@ func (p *PacketFlowTun) WritePacket(packet *stack.PacketBuffer) (int, error) {
 }
 
 func (p *PacketFlowTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, error) {
+	if p.endpoint == nil {
+		return nil, stack.NICOptions{}, fmt.Errorf("packet-flow TUN has no gVisor endpoint in raw mode")
+	}
 	return p.endpoint, stack.NICOptions{}, nil
 }
 

@@ -1,8 +1,11 @@
-package sing_tun
+// Package packetflow adapts a Network Extension packet flow to mihomo's
+// sing-tun stacks without opening another utun interface.
+package packetflow
 
 import (
 	"net/netip"
 	"sync"
+	"sync/atomic"
 
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -15,6 +18,24 @@ var embeddedTun = struct {
 	sync.RWMutex
 	factory TunFactory
 }{}
+
+// stackMode stores a C.TUNStack; the zero value is C.TunGvisor.
+var stackMode atomic.Int32
+
+// SetStackMode selects the userspace IP stack for the embedded TUN. Unknown
+// values fall back to gVisor. Call before parsing the profile; changing it
+// afterwards only takes effect on the next start.
+func SetStackMode(stack C.TUNStack) {
+	if stack != C.TunMips {
+		stack = C.TunGvisor
+	}
+	stackMode.Store(int32(stack))
+}
+
+// StackMode returns the selected stack, defaulting to gVisor.
+func StackMode() C.TUNStack {
+	return C.TUNStack(stackMode.Load())
+}
 
 // SetTunFactory lets an embedding host provide a packet device instead of
 // creating a platform TUN interface. The returned function restores the
@@ -32,7 +53,9 @@ func SetTunFactory(factory TunFactory) func() {
 	}
 }
 
-func embeddedTunFactory(options tun.Options) (tun.Tun, bool, error) {
+// EmbeddedTunFactory resolves a packet device from the registered factory.
+// The second return value reports whether a factory is registered at all.
+func EmbeddedTunFactory(options tun.Options) (tun.Tun, bool, error) {
 	embeddedTun.RLock()
 	factory := embeddedTun.factory
 	embeddedTun.RUnlock()
@@ -60,7 +83,7 @@ func NormalizeForEmbeddedTun(options LC.Tun) LC.Tun {
 
 	options.Enable = true
 	options.Device = "swihomo-packet-flow"
-	options.Stack = C.TunGvisor
+	options.Stack = StackMode()
 	options.AutoRoute = false
 	options.AutoDetectInterface = false
 	options.AutoRedirect = false
