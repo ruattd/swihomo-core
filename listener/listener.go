@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/metacubex/mihomo/adapter/inbound"
+	"github.com/metacubex/mihomo/bridge/packetflow"
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/listener/http"
@@ -496,7 +497,7 @@ func ReCreateMixed(port int, tunnel C.Tunnel) {
 }
 
 func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
-	tunConf = sing_tun.NormalizeForEmbeddedTun(tunConf)
+	tunConf = packetflow.NormalizeForEmbeddedTun(tunConf)
 	tunConf.Sort()
 
 	tunMux.Lock()
