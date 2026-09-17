@@ -24,25 +24,32 @@ const (
 	// inboundQueueSize bounds packets buffered between InjectPacket and the
 	// raw stack's read loop. Sized like the gVisor channel endpoint.
 	inboundQueueSize = 1024
+	// outboundQueueSize bounds packets buffered between the raw stack's
+	// write loop and the emit drain. Sized like the gVisor channel endpoint.
+	outboundQueueSize = 1024
+	// emitBatchSize caps how many outbound packets one emit call carries.
+	emitBatchSize = 32
 )
 
 // PacketFlowTun adapts raw packets from a Network Extension packet flow to
 // mihomo's TUN stacks without opening another utun interface. In gVisor mode
 // packets are injected into a channel endpoint; in raw mode (mips stack)
-// they queue for Read instead.
+// they queue for Read instead. Outbound packets are emitted in batches to
+// amortize the FFI crossing into Network Extension.
 type PacketFlowTun struct {
 	endpoint *channel.Endpoint
 	inbound  chan []byte
+	outbound chan []byte
 	raw      bool
 	context  context.Context
 	cancel   context.CancelFunc
-	emit     func([]byte, int) error
+	emit     func(packets [][]byte, families []int) error
 	close    sync.Once
 }
 
 var _ tun.GVisorTun = (*PacketFlowTun)(nil)
 
-func NewPacketFlowTun(mtu uint32, emit func([]byte, int) error) *PacketFlowTun {
+func NewPacketFlowTun(mtu uint32, emit func(packets [][]byte, families []int) error) *PacketFlowTun {
 	if mtu == 0 {
 		mtu = 1500
 	}
@@ -54,10 +61,12 @@ func NewPacketFlowTun(mtu uint32, emit func([]byte, int) error) *PacketFlowTun {
 	}
 	if StackMode() == C.TunGvisor {
 		p.endpoint = channel.New(inboundQueueSize, mtu, "")
-		go p.drainOutboundPackets()
+		go p.drainEndpoint()
 	} else {
 		p.raw = true
 		p.inbound = make(chan []byte, inboundQueueSize)
+		p.outbound = make(chan []byte, outboundQueueSize)
+		go p.drainOutboundQueue()
 	}
 	return p
 }
@@ -101,14 +110,24 @@ func (p *PacketFlowTun) Read(packet []byte) (int, error) {
 }
 
 func (p *PacketFlowTun) Write(packet []byte) (int, error) {
-	family := packetFlowIPv4
-	if len(packet) > 0 && packet[0]>>4 == 6 {
-		family = packetFlowIPv6
+	if !p.raw {
+		// The gVisor stack writes through the channel endpoint or
+		// WritePacket; a direct Write falls back to a single-packet emit.
+		if err := p.emit([][]byte{append([]byte(nil), packet...)}, []int{packetFamily(packet)}); err != nil {
+			return 0, err
+		}
+		return len(packet), nil
 	}
-	if err := p.emit(append([]byte(nil), packet...), family); err != nil {
-		return 0, err
+	// Never block past Close. Drop on a full queue like the gVisor channel
+	// endpoint does; TCP retransmits cover the loss.
+	select {
+	case p.outbound <- append([]byte(nil), packet...):
+		return len(packet), nil
+	case <-p.context.Done():
+		return 0, io.ErrClosedPipe
+	default:
+		return len(packet), nil
 	}
-	return len(packet), nil
 }
 
 func (p *PacketFlowTun) Close() error {
@@ -126,7 +145,7 @@ func (p *PacketFlowTun) WritePacket(packet *stack.PacketBuffer) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
-	if err := p.emit(data, family); err != nil {
+	if err := p.emit([][]byte{data}, []int{family}); err != nil {
 		return 0, err
 	}
 	return len(data), nil
@@ -139,17 +158,67 @@ func (p *PacketFlowTun) NewEndpoint() (stack.LinkEndpoint, stack.NICOptions, err
 	return p.endpoint, stack.NICOptions{}, nil
 }
 
-func (p *PacketFlowTun) drainOutboundPackets() {
+// drainEndpoint batches gVisor outbound packets: block for the first one,
+// then opportunistically collect whatever else is already queued.
+func (p *PacketFlowTun) drainEndpoint() {
+	var packets [][]byte
+	var families []int
 	for {
 		packet := p.endpoint.ReadContext(p.context)
 		if packet == nil {
 			return
 		}
-		data, family := packetData(packet)
-		packet.DecRef()
-		if len(data) > 0 {
-			_ = p.emit(data, family)
+		packets = packets[:0]
+		families = families[:0]
+		if data, family := packetData(packet); len(data) > 0 {
+			packets = append(packets, data)
+			families = append(families, family)
 		}
+		packet.DecRef()
+		for len(packets) < emitBatchSize {
+			next := p.endpoint.Read()
+			if next == nil {
+				break
+			}
+			if data, family := packetData(next); len(data) > 0 {
+				packets = append(packets, data)
+				families = append(families, family)
+			}
+			next.DecRef()
+		}
+		if len(packets) > 0 {
+			_ = p.emit(packets, families)
+		}
+	}
+}
+
+// drainOutboundQueue batches raw-stack outbound packets the same way
+// drainEndpoint does for the gVisor channel endpoint.
+func (p *PacketFlowTun) drainOutboundQueue() {
+	var packets [][]byte
+	var families []int
+	for {
+		var first []byte
+		select {
+		case first = <-p.outbound:
+		case <-p.context.Done():
+			return
+		}
+		packets = append(packets[:0], first)
+		drain := true
+		for drain && len(packets) < emitBatchSize {
+			select {
+			case packet := <-p.outbound:
+				packets = append(packets, packet)
+			default:
+				drain = false
+			}
+		}
+		families = families[:0]
+		for _, packet := range packets {
+			families = append(families, packetFamily(packet))
+		}
+		_ = p.emit(packets, families)
 	}
 }
 
@@ -160,16 +229,22 @@ func packetFlowProtocol(packet []byte, family int) (tcpip.NetworkProtocolNumber,
 	case packetFlowIPv6:
 		return header.IPv6ProtocolNumber, nil
 	default:
-		if len(packet) > 0 {
-			switch packet[0] >> 4 {
-			case 4:
-				return header.IPv4ProtocolNumber, nil
-			case 6:
-				return header.IPv6ProtocolNumber, nil
-			}
-		}
-		return 0, fmt.Errorf("unsupported packet family %d", family)
+		return packetFamilyProtocol(packet), nil
 	}
+}
+
+func packetFamilyProtocol(packet []byte) tcpip.NetworkProtocolNumber {
+	if packetFamily(packet) == packetFlowIPv6 {
+		return header.IPv6ProtocolNumber
+	}
+	return header.IPv4ProtocolNumber
+}
+
+func packetFamily(packet []byte) int {
+	if len(packet) > 0 && packet[0]>>4 == 6 {
+		return packetFlowIPv6
+	}
+	return packetFlowIPv4
 }
 
 func packetData(packet *stack.PacketBuffer) ([]byte, int) {
