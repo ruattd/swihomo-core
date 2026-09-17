@@ -7,7 +7,7 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 
-void swihomo_emit_packet(const uint8_t *packet, size_t length, int family);
+void swihomo_emit_packets(const uint8_t *buffer, const size_t *lengths, const int *families, size_t count);
 void swihomo_emit_log(const char *level, const char *message);
 */
 import "C"
@@ -109,7 +109,7 @@ func SwihomoCoreStart(
 		packetflow.SetStackMode(constant.TunGvisor)
 	}
 	runtime.restore = packetflow.SetTunFactory(func(options tun.Options) (tun.Tun, error) {
-		packetTun := packetflow.NewPacketFlowTun(options.MTU, emitPacket)
+		packetTun := packetflow.NewPacketFlowTun(options.MTU, emitPackets)
 		runtime.tun = packetTun
 		return packetTun, nil
 	})
@@ -131,16 +131,29 @@ func SwihomoCoreStart(
 	return coreOK
 }
 
-//export SwihomoCoreInputPacket
-func SwihomoCoreInputPacket(packet *C.uint8_t, length C.size_t, family C.int) C.int {
+//export SwihomoCoreInputPackets
+func SwihomoCoreInputPackets(buffer *C.uint8_t, lengths *C.size_t, families *C.int, count C.size_t) C.int {
 	runtime.Lock()
 	defer runtime.Unlock()
 
 	if !runtime.running || runtime.tun == nil {
 		return failLocked(coreNotRunning, fmt.Errorf("mihomo core is not running"))
 	}
-	if err := runtime.tun.InjectPacket(copyBytes(packet, length), int(family)); err != nil {
-		return failLocked(corePacketFailure, err)
+	lengthSlice := unsafe.Slice(lengths, int(count))
+	familySlice := unsafe.Slice(families, int(count))
+	offset := 0
+	// InjectPacket copies each packet before handing it to the stack, so the
+	// sub-slices can alias the caller-owned C buffer.
+	for i := 0; i < int(count); i++ {
+		length := int(lengthSlice[i])
+		if length == 0 {
+			continue
+		}
+		packet := unsafe.Slice((*byte)(unsafe.Add(unsafe.Pointer(buffer), offset)), length)
+		offset += length
+		if err := runtime.tun.InjectPacket(packet, int(familySlice[i])); err != nil {
+			return failLocked(corePacketFailure, err)
+		}
 	}
 	return coreOK
 }
@@ -452,11 +465,28 @@ func copyBytes(pointer *C.uint8_t, length C.size_t) []byte {
 	return C.GoBytes(unsafe.Pointer(pointer), C.int(length))
 }
 
-func emitPacket(packet []byte, family int) error {
-	if len(packet) == 0 {
+func emitPackets(packets [][]byte, families []int) error {
+	total := 0
+	for _, packet := range packets {
+		total += len(packet)
+	}
+	if total == 0 {
 		return nil
 	}
-	C.swihomo_emit_packet((*C.uint8_t)(unsafe.Pointer(&packet[0])), C.size_t(len(packet)), C.int(family))
+	flat := make([]byte, 0, total)
+	lengths := make([]C.size_t, len(packets))
+	cFamilies := make([]C.int, len(packets))
+	for i, packet := range packets {
+		flat = append(flat, packet...)
+		lengths[i] = C.size_t(len(packet))
+		cFamilies[i] = C.int(families[i])
+	}
+	C.swihomo_emit_packets(
+		(*C.uint8_t)(unsafe.Pointer(&flat[0])),
+		&lengths[0],
+		&cFamilies[0],
+		C.size_t(len(packets)),
+	)
 	return nil
 }
 
