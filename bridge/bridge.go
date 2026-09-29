@@ -73,6 +73,7 @@ func SwihomoCoreStart(
 	profileLength C.size_t,
 	homeDirectory *C.char,
 	useMipstack C.int,
+	congestionController *C.char,
 ) C.int {
 	runtime.Lock()
 	defer runtime.Unlock()
@@ -108,6 +109,7 @@ func SwihomoCoreStart(
 	} else {
 		packetflow.SetStackMode(constant.TunGvisor)
 	}
+	packetflow.SetCongestionController(C.GoString(congestionController))
 	runtime.restore = packetflow.SetTunFactory(func(options tun.Options) (tun.Tun, error) {
 		packetTun := packetflow.NewPacketFlowTun(options.MTU, emitPackets)
 		runtime.tun = packetTun
