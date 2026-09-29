@@ -37,6 +37,26 @@ func StackMode() C.TUNStack {
 	return C.TUNStack(stackMode.Load())
 }
 
+// congestionController stores the TCP congestion controller name; empty means
+// the stack default. Only the mips stack honors it.
+var congestionController atomic.Value
+
+// SetCongestionController selects the TCP congestion controller for the mips
+// stack. Call before parsing the profile; changing it afterwards only takes
+// effect on the next start.
+func SetCongestionController(controller string) {
+	congestionController.Store(controller)
+}
+
+// CongestionController returns the selected TCP congestion controller, empty
+// for the stack default.
+func CongestionController() string {
+	if value := congestionController.Load(); value != nil {
+		return value.(string)
+	}
+	return ""
+}
+
 // SetTunFactory lets an embedding host provide a packet device instead of
 // creating a platform TUN interface. The returned function restores the
 // previous factory and must run after the listener has stopped.
@@ -84,6 +104,7 @@ func NormalizeForEmbeddedTun(options LC.Tun) LC.Tun {
 	options.Enable = true
 	options.Device = "swihomo-packet-flow"
 	options.Stack = StackMode()
+	options.CongestionController = CongestionController()
 	options.AutoRoute = false
 	options.AutoDetectInterface = false
 	options.AutoRedirect = false
